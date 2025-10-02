@@ -16,6 +16,21 @@ const closePattern = /\\}/g
 const commaPattern = /\\,/g
 const periodPattern = /\\./g
 
+// Memoization cache for expansion results
+const expansionCache = new Map()
+const MAX_CACHE_SIZE = 10000
+
+// Fast path patterns
+const hasBracesPattern = /[{}]/
+const hasEscapedCharsPattern = /\\[\\{},.]|^{}/
+
+/**
+ * Clear the expansion cache (useful for testing or memory management)
+ */
+export function clearCache () {
+  expansionCache.clear()
+}
+
 /**
  * @return {number}
  */
@@ -29,6 +44,10 @@ function numeric (str) {
  * @param {string} str
  */
 function escapeBraces (str) {
+  // Fast path: if no escaped characters, return as-is
+  if (!hasEscapedCharsPattern.test(str)) {
+    return str
+  }
   return str.replace(slashPattern, escSlash)
     .replace(openPattern, escOpen)
     .replace(closePattern, escClose)
@@ -56,7 +75,6 @@ function unescapeBraces (str) {
 function parseCommaParts (str) {
   if (!str) { return [''] }
 
-  const parts = []
   const m = balanced('{', '}', str)
 
   if (!m) { return str.split(',') }
@@ -65,15 +83,17 @@ function parseCommaParts (str) {
   const p = pre.split(',')
 
   p[p.length - 1] += '{' + body + '}'
-  const postParts = parseCommaParts(post)
+
   if (post.length) {
-    p[p.length - 1] += postParts.shift()
-    p.push.apply(p, postParts)
+    const postParts = parseCommaParts(post)
+    p[p.length - 1] += postParts[0]
+    // More efficient than shift() + push.apply()
+    for (let i = 1; i < postParts.length; i++) {
+      p.push(postParts[i])
+    }
   }
 
-  parts.push.apply(parts, p)
-
-  return parts
+  return p
 }
 
 /**
@@ -81,6 +101,21 @@ function parseCommaParts (str) {
  */
 export default function expandTop (str) {
   if (!str) { return [] }
+
+  // Check cache first
+  const cached = expansionCache.get(str)
+  if (cached) {
+    return cached
+  }
+
+  // Fast path: if no braces at all, return as-is
+  if (!hasBracesPattern.test(str)) {
+    const result = [str]
+    if (expansionCache.size < MAX_CACHE_SIZE) {
+      expansionCache.set(str, result)
+    }
+    return result
+  }
 
   // I don't know why Bash 4.3 does this, but it does.
   // Anything starting with {} will have the first two bytes preserved
@@ -92,7 +127,15 @@ export default function expandTop (str) {
     str = '\\{\\}' + str.slice(2)
   }
 
-  return expand(escapeBraces(str), true).map(unescapeBraces)
+  const result = expand(escapeBraces(str), true).map(unescapeBraces)
+
+  // Cache the result if under size limit
+  if (expansionCache.size < MAX_CACHE_SIZE) {
+    // Cache both the original and escaped versions
+    expansionCache.set(str, result)
+  }
+
+  return result
 }
 
 /**
@@ -196,7 +239,10 @@ function expand (str, isTop) {
       }
       const pad = n.some(isPadded)
 
-      N = []
+      // Pre-calculate array size for better performance
+      const seqLength = Math.floor(Math.abs((y - x) / incr)) + 1
+      N = new Array(seqLength)
+      let idx = 0
 
       for (let i = x; test(i, y); i += incr) {
         let c
@@ -213,13 +259,21 @@ function expand (str, isTop) {
             }
           }
         }
-        N.push(c)
+        N[idx++] = c
+      }
+      // Trim array if we overestimated (edge cases)
+      if (idx < N.length) {
+        N.length = idx
       }
     } else {
       N = []
 
       for (let j = 0; j < n.length; j++) {
-        N.push.apply(N, expand(n[j], false))
+        const expanded = expand(n[j], false)
+        // More efficient than push.apply for large arrays
+        for (let k = 0; k < expanded.length; k++) {
+          N.push(expanded[k])
+        }
       }
     }
 

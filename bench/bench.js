@@ -1,6 +1,6 @@
 /* global bench */
 
-import expand from '..'
+import expand from '../index.js'
 import fs from 'fs'
 
 const resfile = new URL('../test/cases.txt', import.meta.url)
