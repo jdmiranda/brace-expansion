@@ -16,19 +16,63 @@ const closePattern = /\\}/g
 const commaPattern = /\\,/g
 const periodPattern = /\\./g
 
-// Memoization cache for expansion results
-const expansionCache = new Map()
-const MAX_CACHE_SIZE = 10000
+// LRU Cache implementation for expansion results
+class LRUCache {
+  constructor (maxSize) {
+    this.maxSize = maxSize
+    this.cache = new Map()
+  }
 
-// Fast path patterns
+  get (key) {
+    if (!this.cache.has(key)) return undefined
+    // Move to end (most recently used)
+    const value = this.cache.get(key)
+    this.cache.delete(key)
+    this.cache.set(key, value)
+    return value
+  }
+
+  set (key, value) {
+    // Delete if exists to update position
+    if (this.cache.has(key)) {
+      this.cache.delete(key)
+    } else if (this.cache.size >= this.maxSize) {
+      // Delete least recently used (first item)
+      const firstKey = this.cache.keys().next().value
+      this.cache.delete(firstKey)
+    }
+    this.cache.set(key, value)
+  }
+
+  clear () {
+    this.cache.clear()
+  }
+
+  get size () {
+    return this.cache.size
+  }
+}
+
+// Memoization cache for expansion results (LRU with 500 entries for main cache)
+const expansionCache = new LRUCache(500)
+
+// Pattern parsing memoization (smaller cache as patterns repeat less)
+const parseCache = new LRUCache(250)
+
+// Recursion memoization cache (larger for deep recursion)
+const recursionCache = new LRUCache(750)
+
+// Fast path patterns (pre-compiled regex cache)
 const hasBracesPattern = /[{}]/
 const hasEscapedCharsPattern = /\\[\\{},.]|^{}/
 
 /**
- * Clear the expansion cache (useful for testing or memory management)
+ * Clear all caches (useful for testing or memory management)
  */
 export function clearCache () {
   expansionCache.clear()
+  parseCache.clear()
+  recursionCache.clear()
 }
 
 /**
@@ -75,9 +119,19 @@ function unescapeBraces (str) {
 function parseCommaParts (str) {
   if (!str) { return [''] }
 
+  // Check parse cache first
+  const cached = parseCache.get(str)
+  if (cached) {
+    return cached
+  }
+
   const m = balanced('{', '}', str)
 
-  if (!m) { return str.split(',') }
+  if (!m) {
+    const result = str.split(',')
+    parseCache.set(str, result)
+    return result
+  }
 
   const { pre, body, post } = m
   const p = pre.split(',')
@@ -93,6 +147,8 @@ function parseCommaParts (str) {
     }
   }
 
+  // Cache the result
+  parseCache.set(str, p)
   return p
 }
 
@@ -102,7 +158,7 @@ function parseCommaParts (str) {
 export default function expandTop (str) {
   if (!str) { return [] }
 
-  // Check cache first
+  // Check cache first (LRU automatically manages size)
   const cached = expansionCache.get(str)
   if (cached) {
     return cached
@@ -111,9 +167,7 @@ export default function expandTop (str) {
   // Fast path: if no braces at all, return as-is
   if (!hasBracesPattern.test(str)) {
     const result = [str]
-    if (expansionCache.size < MAX_CACHE_SIZE) {
-      expansionCache.set(str, result)
-    }
+    expansionCache.set(str, result)
     return result
   }
 
@@ -129,11 +183,8 @@ export default function expandTop (str) {
 
   const result = expand(escapeBraces(str), true).map(unescapeBraces)
 
-  // Cache the result if under size limit
-  if (expansionCache.size < MAX_CACHE_SIZE) {
-    // Cache both the original and escaped versions
-    expansionCache.set(str, result)
-  }
+  // Cache the result (LRU automatically manages size)
+  expansionCache.set(str, result)
 
   return result
 }
@@ -173,11 +224,25 @@ function gte (i, y) {
  * @param {boolean} [isTop]
  */
 function expand (str, isTop) {
+  // Check recursion cache for non-top level expansions
+  if (!isTop) {
+    const cached = recursionCache.get(str)
+    if (cached) {
+      return cached
+    }
+  }
+
   /** @type {string[]} */
   const expansions = []
 
   const m = balanced('{', '}', str)
-  if (!m) return [str]
+  if (!m) {
+    const result = [str]
+    if (!isTop) {
+      recursionCache.set(str, result)
+    }
+    return result
+  }
 
   // no need to expand pre, since it is guaranteed to be free of brace-sets
   const pre = m.pre
@@ -186,8 +251,11 @@ function expand (str, isTop) {
     : ['']
 
   if (/\$$/.test(m.pre)) {
+    // Pre-compile string parts for better performance
+    const prefix = pre + '{'
+    const suffix = '}'
     for (let k = 0; k < post.length; k++) {
-      const expansion = pre + '{' + m.body + '}' + post[k]
+      const expansion = prefix + m.body + suffix + post[k]
       expansions.push(expansion)
     }
   } else {
@@ -201,7 +269,11 @@ function expand (str, isTop) {
         str = m.pre + '{' + m.body + escClose + m.post
         return expand(str)
       }
-      return [str]
+      const result = [str]
+      if (!isTop) {
+        recursionCache.set(str, result)
+      }
+      return result
     }
 
     let n
@@ -213,9 +285,13 @@ function expand (str, isTop) {
         // x{{a,b}}y ==> x{a}y x{b}y
         n = expand(n[0], false).map(embrace)
         if (n.length === 1) {
-          return post.map(function (p) {
+          const result = post.map(function (p) {
             return m.pre + n[0] + p
           })
+          if (!isTop) {
+            recursionCache.set(str, result)
+          }
+          return result
         }
       }
     }
@@ -283,6 +359,11 @@ function expand (str, isTop) {
         if (!isTop || isSequence || expansion) { expansions.push(expansion) }
       }
     }
+  }
+
+  // Cache recursion results
+  if (!isTop) {
+    recursionCache.set(str, expansions)
   }
 
   return expansions
